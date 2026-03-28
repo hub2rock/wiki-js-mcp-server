@@ -1,0 +1,29 @@
+services:
+  wiki-js-mcp:
+    image: hub2rock/wiki-js-mcp-server:latest
+    container_name: wiki-js-mcp
+    restart: unless-stopped
+
+    ports:
+      - "127.0.0.1:8000:8000"   # Bind local only — expose via nginx reverse proxy
+
+    volumes:
+      - ./.env:/app/.env:ro
+      - mcp-data:/app/data
+
+    environment:
+      MCP_TRANSPORT: http
+      WIKIJS_MCP_DB: /app/data/wikijs_mappings.db
+      LOG_FILE: /app/data/wikijs_mcp.log
+
+    healthcheck:
+      test: ["CMD", "python3", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+volumes:
+  mcp-data:
+    driver: local

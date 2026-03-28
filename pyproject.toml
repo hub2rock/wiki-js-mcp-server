@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wiki-js-mcp-server"
+version = "1.0.0"
+description = "Wiki.js MCP server — 23 tools, dual transport stdio/HTTP, production-ready"
+authors = [{name = "hub2rock"}]
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "python-slugify>=8.0.0",
+    "python-dotenv>=1.0.0",
+    "sqlalchemy>=2.0.0",
+    "tenacity>=8.0.0",
+    "uvicorn[standard]>=0.24.0",
+]
+
+[project.scripts]
+wiki-js-mcp-server = "server:main"
+
+[project.urls]
+Homepage = "https://github.com/hub2rock/wiki-js-mcp-server"
+Repository = "https://github.com/hub2rock/wiki-js-mcp-server"
+
+[tool.setuptools.packages.find]
+where = ["src"]
