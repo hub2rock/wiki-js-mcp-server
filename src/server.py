@@ -316,7 +316,7 @@ async def wikijs_create_page(
 
 
 @mcp.tool()
-async def wikijs_get_page(page_id: int = None, path: str = None, locale: str = "en") -> str:
+async def wikijs_get_page(page_id: int = None, path: str = None, locale: str = "en", include_content: bool = True, max_content_chars: int = 800000) -> str:
     """
     Get a Wiki.js page by ID or path.
 
@@ -324,6 +324,8 @@ async def wikijs_get_page(page_id: int = None, path: str = None, locale: str = "
         page_id: Page ID (use either page_id OR path)
         path: Page path e.g. 'infra/proxmox' (use either page_id OR path)
         locale: Locale (default: en)
+        include_content: Include page content (default: True). Set False for metadata only.
+        max_content_chars: Truncate content at this many chars (default: 800000 ~800KB).
     """
     try:
         if not page_id and not path:
@@ -348,11 +350,20 @@ async def wikijs_get_page(page_id: int = None, path: str = None, locale: str = "
             if not pg:
                 return json.dumps({"error": "Page not found"})
 
+            page_content = pg["content"] if include_content else ""
+            content_size = len(page_content.encode("utf-8"))
+            truncated = False
+            if include_content and content_size > max_content_chars:
+                page_content = page_content[:max_content_chars] + "\n\n[... contenu tronqué — page trop grande pour le MCP]"
+                truncated = True
+
             return json.dumps({
                 "pageId": pg["id"],
                 "title": pg["title"],
                 "path": pg["path"],
-                "content": pg["content"],
+                "content": page_content,
+                "content_size_bytes": content_size,
+                "content_truncated": truncated,
                 "description": pg.get("description", ""),
                 "isPublished": pg.get("isPublished"),
                 "locale": pg.get("locale"),
@@ -366,6 +377,68 @@ async def wikijs_get_page(page_id: int = None, path: str = None, locale: str = "
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+
+
+
+@mcp.tool()
+async def wikijs_get_page_metadata(page_id: int = None, path: str = None, locale: str = "en") -> str:
+    """
+    Get page metadata only — no content. Fast and always within size limits.
+    Use this when wikijs_get_page fails due to page size (large images, etc.)
+
+    Args:
+        page_id: Page ID (use either page_id OR path)
+        path: Page path (use either page_id OR path)
+        locale: Locale (default: en)
+    """
+    try:
+        if not page_id and not path:
+            return json.dumps({"error": "Provide page_id or path"})
+
+        async with WikiJSClient() as c:
+            if page_id:
+                q = """query($id:Int!){pages{single(id:$id){
+                    id path title description isPublished locale
+                    createdAt updatedAt editor authorName tags{tag}
+                    content
+                }}}"""
+                data = await c.query(q, {"id": page_id})
+                pg = data.get("pages", {}).get("single")
+            else:
+                q = """query($path:String!,$locale:String!){pages{singleByPath(path:$path,locale:$locale){
+                    id path title description isPublished locale
+                    createdAt updatedAt editor authorName tags{tag}
+                    content
+                }}}"""
+                data = await c.query(q, {"path": path, "locale": locale})
+                pg = data.get("pages", {}).get("singleByPath")
+
+            if not pg:
+                return json.dumps({"error": "Page not found"})
+
+            raw_content = pg.get("content", "")
+            content_bytes = len(raw_content.encode("utf-8"))
+
+            return json.dumps({
+                "pageId": pg["id"],
+                "title": pg["title"],
+                "path": pg["path"],
+                "description": pg.get("description", ""),
+                "isPublished": pg.get("isPublished"),
+                "locale": pg.get("locale"),
+                "editor": pg.get("editor"),
+                "author": pg.get("authorName"),
+                "createdAt": pg.get("createdAt"),
+                "updatedAt": pg.get("updatedAt"),
+                "tags": [t["tag"] for t in pg.get("tags", [])],
+                "content_size_bytes": content_bytes,
+                "content_size_kb": round(content_bytes / 1024, 1),
+                "has_large_content": content_bytes > 500_000,
+                "tip": "Use wikijs_get_page with include_content=False to get metadata only, or include_content=True with max_content_chars to truncate." if content_bytes > 500_000 else None,
+            })
+
+    except Exception as e:
+        return json.dumps({"error": str(e)})
 
 @mcp.tool()
 async def wikijs_update_page(

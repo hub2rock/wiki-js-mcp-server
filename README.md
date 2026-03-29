@@ -1,6 +1,6 @@
 # Wiki.js MCP Server
 
-> A comprehensive **Model Context Protocol (MCP) server** for Wiki.js — 23 tools, dual transport (stdio + HTTP/SSE), built for production self-hosted infrastructure.
+> A comprehensive **Model Context Protocol (MCP) server** for Wiki.js — 24 tools, dual transport (stdio + HTTP/SSE), built for production self-hosted infrastructure.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/)
@@ -76,7 +76,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop → **Settings → Developer** → you should see `wikijs` with a 🟢 green dot and 23 tools listed.
+Restart Claude Desktop → **Settings → Developer** → you should see `wikijs` with a 🟢 green dot and 24 tools listed.
 
 ### 4. Verify the connection
 
@@ -84,7 +84,7 @@ Ask Claude: *"Check my Wiki.js connection status"* or *"List all pages in my wik
 
 ---
 
-## 📊 MCP Tools (23 Total)
+## 📊 MCP Tools (24 Total)
 
 ### 🔧 Connection
 
@@ -97,7 +97,8 @@ Ask Claude: *"Check my Wiki.js connection status"* or *"List all pages in my wik
 | Tool | Description |
 |------|-------------|
 | `wikijs_create_page` | Create a new page with optional path or parent |
-| `wikijs_get_page` | Retrieve a page by ID or path |
+| `wikijs_get_page` | Retrieve a page by ID or path (with content size controls) |
+| `wikijs_get_page_metadata` | Retrieve page metadata only — no content, always fast |
 | `wikijs_update_page` | Update content, title, description, or tags |
 | `wikijs_delete_page` | Delete a page by ID or path |
 | `wikijs_move_page` | Move a page to a new path or locale |
@@ -138,6 +139,27 @@ Ask Claude: *"Check my Wiki.js connection status"* or *"List all pages in my wik
 | `wikijs_bulk_update_project_docs` | Batch sync multiple changed files to their wiki pages |
 | `wikijs_cleanup_orphaned_mappings` | Remove mappings to deleted wiki pages |
 | `wikijs_repository_context` | Show current repo context and active mappings |
+
+---
+
+## 📄 Handling Large Pages
+
+Wiki.js pages with embedded images (base64 inline) can exceed the MCP response size limit. Two tools address this:
+
+**`wikijs_get_page`** now accepts:
+- `include_content=False` — returns metadata only, no content
+- `max_content_chars=800000` — auto-truncates at ~800KB with a warning
+
+**`wikijs_get_page_metadata`** — always fast, returns size info:
+```json
+{
+  "pageId": 8,
+  "title": "Proxmox",
+  "content_size_kb": 2400.5,
+  "has_large_content": true,
+  "tip": "Use wikijs_get_page with include_content=False..."
+}
+```
 
 ---
 
@@ -277,6 +299,12 @@ pip install -r requirements.txt
 python -c "from slugify import slugify; print('OK')"
 ```
 
+### Page too large — MCP response size exceeded
+Use `wikijs_get_page_metadata` to check the page size, then either:
+- Use `wikijs_get_page(include_content=False)` for metadata only
+- Use `wikijs_get_page(max_content_chars=500000)` to truncate
+- Clean up embedded base64 images in the Wiki.js editor (replace with proper media assets)
+
 ### Connection or authentication errors
 - Verify your `WIKIJS_URL` has no trailing slash
 - Ensure the API is enabled in Wiki.js Administration
@@ -290,7 +318,7 @@ python -c "from slugify import slugify; print('OK')"
 ```
 wiki-js-mcp-server/
 ├── src/
-│   └── server.py              # MCP server — all 23 tools
+│   └── server.py              # MCP server — all 24 tools
 ├── config/
 │   └── example.env            # Configuration template
 ├── Dockerfile                 # python:3.12-slim, non-root user
