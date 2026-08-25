@@ -14,6 +14,7 @@ import logging
 import os
 import ast
 from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -25,13 +26,43 @@ from fastmcp import FastMCP
 from pydantic import Field, ConfigDict
 from pydantic_settings import BaseSettings
 from slugify import slugify
-from sqlalchemy import Column, DateTime, Integer, String, create_engine
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    text,
+)
 from sqlalchemy.orm import declarative_base, sessionmaker
+from starlette.applications import Starlette
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 from tenacity import before_sleep_log, retry, stop_after_attempt, wait_exponential
+
+# PyJWT — only needed for MCP_AUTH_MODE=oauth (multi-user HTTP mode).
+try:
+    import jwt
+    from jwt import PyJWKClient
+
+    _JWT_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    _JWT_AVAILABLE = False
+
+# Fernet — optional encryption-at-rest for stored per-user Wiki.js keys.
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+
+    _FERNET_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    _FERNET_AVAILABLE = False
 
 load_dotenv()
 
-__version__ = "1.1.0"
+__version__ = "2.0.0"
 
 UTC = ZoneInfo("UTC")
 _MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024  # 5 MB — protection against huge files
@@ -44,6 +75,8 @@ class Settings(BaseSettings):
     model_config = ConfigDict(env_file=".env", extra="ignore")
 
     WIKIJS_URL: str = Field(default="http://localhost:3000")
+    # Single-user fallback key. Used when MCP_AUTH_MODE=none (stdio / personal use).
+    # In oauth mode each user registers their own key instead — see UserKey.
     WIKIJS_API_KEY: str = Field(default="")
     WIKIJS_GRAPHQL_ENDPOINT: str = Field(default="/graphql")
 
@@ -51,6 +84,33 @@ class Settings(BaseSettings):
     MCP_TRANSPORT: str = Field(default="stdio")  # stdio | http
     HTTP_HOST: str = Field(default="0.0.0.0")
     HTTP_PORT: int = Field(default=8000)
+
+    # ── Auth (multi-user connector mode) ────────────────────────────────────
+    # none  → single shared WIKIJS_API_KEY (stdio, personal use)
+    # oauth → OAuth 2.1 resource server; every caller brings their own
+    #         Wiki.js API key, so Wiki.js permissions apply per user.
+    MCP_AUTH_MODE: str = Field(default="none")
+
+    # Public base URL this server is reachable at (no trailing slash).
+    # Required in oauth mode: it is the `resource` identifier advertised in the
+    # RFC 9728 protected-resource metadata that MCP clients discover.
+    MCP_PUBLIC_URL: str = Field(default="")
+
+    # OAuth issuer (Authentik application URL, e.g.
+    # https://auth.example.com/application/o/wikijs-mcp/). JWKS is discovered
+    # from its OIDC configuration unless OAUTH_JWKS_URL is set explicitly.
+    OAUTH_ISSUER: str = Field(default="")
+    OAUTH_JWKS_URL: str = Field(default="")
+    OAUTH_AUDIENCE: str = Field(default="")
+    OAUTH_ALGORITHMS: str = Field(default="RS256")
+    # Space- or comma-separated scopes a token must carry. Empty = no check.
+    OAUTH_REQUIRED_SCOPES: str = Field(default="")
+    OAUTH_SUPPORTED_SCOPES: str = Field(default="openid profile email")
+
+    # Fernet key (44-char urlsafe base64) encrypting stored per-user Wiki.js
+    # keys at rest. Generate with:
+    #   python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+    MCP_ENCRYPTION_KEY: str = Field(default="")
 
     # Local DB (file→page mappings)
     WIKIJS_MCP_DB: str = Field(default="./wikijs_mappings.db")
@@ -69,18 +129,61 @@ class Settings(BaseSettings):
     def graphql_url(self) -> str:
         return f"{self.WIKIJS_URL.rstrip('/')}{self.WIKIJS_GRAPHQL_ENDPOINT}"
 
-    @property
-    def headers(self) -> Dict[str, str]:
+    def headers_for(self, api_key: str) -> Dict[str, str]:
         return {
-            "Authorization": f"Bearer {self.WIKIJS_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
+
+    @property
+    def oauth_enabled(self) -> bool:
+        return self.MCP_AUTH_MODE.strip().lower() == "oauth"
+
+    @property
+    def algorithms(self) -> List[str]:
+        return [a for a in self.OAUTH_ALGORITHMS.replace(",", " ").split() if a]
+
+    @property
+    def required_scopes(self) -> List[str]:
+        return [s for s in self.OAUTH_REQUIRED_SCOPES.replace(",", " ").split() if s]
+
+    @property
+    def supported_scopes(self) -> List[str]:
+        return [s for s in self.OAUTH_SUPPORTED_SCOPES.replace(",", " ").split() if s]
+
+    @property
+    def resource_identifier(self) -> str:
+        """The canonical `resource` URI advertised to MCP clients (RFC 9728)."""
+        return f"{self.MCP_PUBLIC_URL.rstrip('/')}/mcp"
 
     def validate_config(self) -> None:
         if not self.WIKIJS_URL:
             raise ValueError("WIKIJS_URL must be set.")
-        if not self.WIKIJS_API_KEY:
-            raise ValueError("WIKIJS_API_KEY must be set.")
+
+        if self.oauth_enabled:
+            if not _JWT_AVAILABLE:
+                raise ValueError(
+                    "MCP_AUTH_MODE=oauth requires PyJWT with crypto extras. "
+                    "Install it with: pip install 'pyjwt[crypto]'"
+                )
+            if not self.OAUTH_ISSUER:
+                raise ValueError("OAUTH_ISSUER must be set when MCP_AUTH_MODE=oauth.")
+            if not self.MCP_PUBLIC_URL:
+                raise ValueError("MCP_PUBLIC_URL must be set when MCP_AUTH_MODE=oauth.")
+            if self.MCP_ENCRYPTION_KEY and not _FERNET_AVAILABLE:
+                raise ValueError(
+                    "MCP_ENCRYPTION_KEY is set but the 'cryptography' package is missing."
+                )
+            if not self.MCP_ENCRYPTION_KEY:
+                logger.warning(
+                    "MCP_ENCRYPTION_KEY is not set — per-user Wiki.js API keys will be "
+                    "stored in plaintext in %s. Set it to encrypt them at rest.",
+                    self.WIKIJS_MCP_DB,
+                )
+        elif not self.WIKIJS_API_KEY:
+            raise ValueError(
+                "WIKIJS_API_KEY must be set (or set MCP_AUTH_MODE=oauth for per-user keys)."
+            )
 
 
 settings = Settings()
@@ -105,11 +208,19 @@ logger = logging.getLogger("wiki-js-mcp")
 
 Base = declarative_base()
 
+# Owner value used when the server runs without OAuth (single-user stdio mode).
+_SINGLE_USER_OWNER = "__local__"
+
 
 class FileMapping(Base):
     __tablename__ = "file_mappings"
+    __table_args__ = (UniqueConstraint("owner_sub", "file_path", name="uq_owner_file"),)
+
     id = Column(Integer, primary_key=True)
-    file_path = Column(String, unique=True, nullable=False)
+    # OAuth subject of the user who owns this mapping. Mappings are private to
+    # their owner so two users can map the same path independently.
+    owner_sub = Column(String, nullable=False, default=_SINGLE_USER_OWNER, index=True)
+    file_path = Column(String, nullable=False)
     page_id = Column(Integer, nullable=False)
     relationship_type = Column(String, nullable=False)
     last_updated = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
@@ -118,8 +229,88 @@ class FileMapping(Base):
     space_name = Column(String, default="")
 
 
+class UserKey(Base):
+    """A single user's Wiki.js API key, keyed by their OAuth subject.
+
+    This is what makes the server multi-tenant: every Wiki.js call is made with
+    the calling user's own key, so Wiki.js enforces that user's own permissions.
+    """
+
+    __tablename__ = "user_keys"
+    id = Column(Integer, primary_key=True)
+    owner_sub = Column(String, unique=True, nullable=False, index=True)
+    # Encrypted when MCP_ENCRYPTION_KEY is configured (see is_encrypted).
+    wikijs_api_key = Column(Text, nullable=False)
+    is_encrypted = Column(Boolean, nullable=False, default=False)
+    label = Column(String, default="")
+    created_at = Column(DateTime, default=lambda: datetime.datetime.now(UTC))
+    last_used = Column(DateTime)
+
+
 engine = create_engine(f"sqlite:///{settings.WIKIJS_MCP_DB}", connect_args={"check_same_thread": False})
-Base.metadata.create_all(engine)
+
+
+def _legacy_file_mappings_schema(conn) -> bool:
+    """True if file_mappings still carries the pre-multi-user UNIQUE(file_path)."""
+    if not conn.execute(text("PRAGMA table_info(file_mappings)")).fetchall():
+        return False  # table does not exist yet
+    for idx in conn.execute(text("PRAGMA index_list(file_mappings)")).fetchall():
+        name, is_unique = idx[1], idx[2]
+        if not is_unique:
+            continue
+        cols = [r[2] for r in conn.execute(text(f'PRAGMA index_info("{name}")')).fetchall()]
+        if cols == ["file_path"]:
+            return True
+    return False
+
+
+def _init_db() -> None:
+    """Create tables, migrating a pre-2.0 single-user database if present.
+
+    Pre-2.0 file_mappings had UNIQUE(file_path) and no owner_sub. SQLite cannot
+    drop a constraint in place, so the table is renamed, recreated by
+    create_all(), and its rows copied back under the single-user owner.
+    """
+    rebuild = False
+    with engine.connect() as conn:
+        if _legacy_file_mappings_schema(conn):
+            logger.info("Migrating file_mappings to the multi-user schema…")
+            conn.execute(text("ALTER TABLE file_mappings RENAME TO file_mappings_legacy"))
+            conn.commit()
+            rebuild = True
+
+    Base.metadata.create_all(engine)
+
+    with engine.connect() as conn:
+        if rebuild:
+            conn.execute(
+                text(
+                    "INSERT INTO file_mappings "
+                    "(owner_sub, file_path, page_id, relationship_type, last_updated, "
+                    " file_hash, repository_root, space_name) "
+                    "SELECT :owner, file_path, page_id, relationship_type, last_updated, "
+                    "       file_hash, repository_root, space_name "
+                    "FROM file_mappings_legacy"
+                ),
+                {"owner": _SINGLE_USER_OWNER},
+            )
+            conn.execute(text("DROP TABLE file_mappings_legacy"))
+            conn.commit()
+            logger.info("file_mappings migration complete.")
+        else:
+            # Non-legacy database that predates owner_sub (additive upgrade only).
+            cols = {r[1] for r in conn.execute(text("PRAGMA table_info(file_mappings)")).fetchall()}
+            if cols and "owner_sub" not in cols:
+                conn.execute(
+                    text(
+                        "ALTER TABLE file_mappings ADD COLUMN owner_sub VARCHAR "
+                        f"NOT NULL DEFAULT '{_SINGLE_USER_OWNER}'"
+                    )
+                )
+                conn.commit()
+
+
+_init_db()
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -138,14 +329,113 @@ def get_db():
 
 
 # ---------------------------------------------------------------------------
+# Per-request identity (multi-user)
+# ---------------------------------------------------------------------------
+
+# Set by the auth middleware for the duration of one HTTP request. Every tool
+# resolves the calling user's Wiki.js key from this, so a single server process
+# serves many users without ever mixing their credentials.
+_current_sub: ContextVar[Optional[str]] = ContextVar("current_sub", default=None)
+_current_claims: ContextVar[Optional[Dict[str, Any]]] = ContextVar("current_claims", default=None)
+
+
+class AuthError(Exception):
+    """Raised when the caller has no usable Wiki.js credential."""
+
+
+def current_owner() -> str:
+    """Identity that owns file mappings for the current call."""
+    if not settings.oauth_enabled:
+        return _SINGLE_USER_OWNER
+    sub = _current_sub.get()
+    if not sub:
+        raise AuthError("No authenticated user in the current request context.")
+    return sub
+
+
+def _fernet() -> Optional["Fernet"]:
+    if not settings.MCP_ENCRYPTION_KEY or not _FERNET_AVAILABLE:
+        return None
+    try:
+        return Fernet(settings.MCP_ENCRYPTION_KEY.encode())
+    except Exception as e:
+        raise ValueError(f"MCP_ENCRYPTION_KEY is not a valid Fernet key: {e}")
+
+
+def store_user_key(owner_sub: str, api_key: str, label: str = "") -> None:
+    """Persist (and optionally encrypt) one user's Wiki.js API key."""
+    f = _fernet()
+    stored, encrypted = (f.encrypt(api_key.encode()).decode(), True) if f else (api_key, False)
+    with get_db() as db:
+        row = db.query(UserKey).filter(UserKey.owner_sub == owner_sub).first()
+        if row:
+            row.wikijs_api_key = stored
+            row.is_encrypted = encrypted
+            row.label = label
+        else:
+            db.add(UserKey(owner_sub=owner_sub, wikijs_api_key=stored, is_encrypted=encrypted, label=label))
+
+
+def load_user_key(owner_sub: str) -> Optional[str]:
+    """Return one user's decrypted Wiki.js API key, or None if unregistered."""
+    with get_db() as db:
+        row = db.query(UserKey).filter(UserKey.owner_sub == owner_sub).first()
+        if not row:
+            return None
+        stored, encrypted = row.wikijs_api_key, row.is_encrypted
+        row.last_used = datetime.datetime.now(UTC)
+
+    if not encrypted:
+        return stored
+    f = _fernet()
+    if not f:
+        raise AuthError(
+            "Your stored Wiki.js key is encrypted but MCP_ENCRYPTION_KEY is not configured "
+            "on the server. Restore the key or re-register with wikijs_register_my_key."
+        )
+    try:
+        return f.decrypt(stored.encode()).decode()
+    except InvalidToken:
+        raise AuthError(
+            "Your stored Wiki.js key could not be decrypted (MCP_ENCRYPTION_KEY changed). "
+            "Re-register it with wikijs_register_my_key."
+        )
+
+
+def resolve_api_key() -> str:
+    """The Wiki.js API key to use for the current call."""
+    if not settings.oauth_enabled:
+        return settings.WIKIJS_API_KEY
+
+    key = load_user_key(current_owner())
+    if not key:
+        raise AuthError(
+            "No Wiki.js API key registered for your account. Create one in Wiki.js under "
+            "Administration → API Access, then call wikijs_register_my_key with it. "
+            "Your key determines which pages you can read and edit."
+        )
+    return key
+
+
+def owned_mappings(db):
+    """FileMapping query restricted to the calling user's own mappings."""
+    return db.query(FileMapping).filter(FileMapping.owner_sub == current_owner())
+
+
+# ---------------------------------------------------------------------------
 # GraphQL Client
 # ---------------------------------------------------------------------------
 
 class WikiJSClient:
-    """Async Wiki.js GraphQL client with retry logic."""
+    """Async Wiki.js GraphQL client with retry logic.
 
-    def __init__(self):
-        self.client = httpx.AsyncClient(timeout=120.0, headers=settings.headers)
+    The API key is resolved per instance — in oauth mode that is the calling
+    user's own key, so Wiki.js applies their permissions to every operation.
+    """
+
+    def __init__(self, api_key: str = None):
+        key = api_key if api_key is not None else resolve_api_key()
+        self.client = httpx.AsyncClient(timeout=120.0, headers=settings.headers_for(key))
 
     async def __aenter__(self):
         return self
@@ -252,6 +542,152 @@ async def resolve_default_locale(c: "WikiJSClient", override: Optional[str] = No
 
 
 # ---------------------------------------------------------------------------
+# OAuth 2.1 resource server (multi-user connector mode)
+# ---------------------------------------------------------------------------
+
+_jwks_client: Optional["PyJWKClient"] = None
+_jwks_lock = asyncio.Lock()
+
+
+async def _discover_jwks_url() -> str:
+    """Resolve the issuer's JWKS URL, via OIDC discovery when not configured."""
+    if settings.OAUTH_JWKS_URL:
+        return settings.OAUTH_JWKS_URL
+
+    disco = f"{settings.OAUTH_ISSUER.rstrip('/')}/.well-known/openid-configuration"
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        resp = await c.get(disco)
+        resp.raise_for_status()
+        jwks_uri = resp.json().get("jwks_uri")
+    if not jwks_uri:
+        raise ValueError(f"No jwks_uri in OIDC discovery document at {disco}")
+    logger.info("Discovered JWKS URL: %s", jwks_uri)
+    return jwks_uri
+
+
+async def _get_jwks_client() -> "PyJWKClient":
+    global _jwks_client
+    if _jwks_client is not None:
+        return _jwks_client
+    async with _jwks_lock:
+        if _jwks_client is None:  # re-check inside the lock
+            _jwks_client = PyJWKClient(await _discover_jwks_url(), cache_keys=True)
+    return _jwks_client
+
+
+async def validate_bearer_token(token: str) -> Dict[str, Any]:
+    """Verify a bearer token's signature, issuer, audience and scopes.
+
+    Raises PermissionError for a valid token lacking required scopes, and
+    ValueError for anything that makes the token unusable.
+    """
+    client = await _get_jwks_client()
+    # PyJWKClient does blocking I/O when a key is not cached yet.
+    signing_key = await asyncio.to_thread(client.get_signing_key_from_jwt, token)
+
+    claims = jwt.decode(
+        token,
+        signing_key.key,
+        algorithms=settings.algorithms,
+        audience=settings.OAUTH_AUDIENCE or None,
+        issuer=settings.OAUTH_ISSUER or None,
+        options={"verify_aud": bool(settings.OAUTH_AUDIENCE)},
+        leeway=60,
+    )
+
+    required = settings.required_scopes
+    if required:
+        raw = claims.get("scope") or claims.get("scp") or ""
+        granted = set(raw.split()) if isinstance(raw, str) else set(raw)
+        missing = [s for s in required if s not in granted]
+        if missing:
+            raise PermissionError(f"Token is missing required scope(s): {', '.join(missing)}")
+
+    return claims
+
+
+def _resource_metadata_url() -> str:
+    return f"{settings.MCP_PUBLIC_URL.rstrip('/')}/.well-known/oauth-protected-resource"
+
+
+def _auth_challenge(detail: str, status: int = 401) -> JSONResponse:
+    """401/403 carrying the RFC 9728 pointer clients use to find the auth server."""
+    err = "invalid_token" if status == 401 else "insufficient_scope"
+    return JSONResponse(
+        {"error": err, "error_description": detail},
+        status_code=status,
+        headers={
+            "WWW-Authenticate": (
+                f'Bearer realm="wiki-js-mcp-server", error="{err}", '
+                f'error_description="{detail}", '
+                f'resource_metadata="{_resource_metadata_url()}"'
+            )
+        },
+    )
+
+
+async def protected_resource_metadata(request) -> JSONResponse:
+    """RFC 9728 metadata — tells MCP clients which authorization server to use."""
+    return JSONResponse(
+        {
+            "resource": settings.resource_identifier,
+            "authorization_servers": [settings.OAUTH_ISSUER.rstrip("/")],
+            "scopes_supported": settings.supported_scopes,
+            "bearer_methods_supported": ["header"],
+            "resource_documentation": "https://github.com/2rock-Inc/wiki-js-mcp-server",
+        }
+    )
+
+
+class OAuthResourceServerMiddleware:
+    """Pure-ASGI bearer-token gate.
+
+    Implemented as raw ASGI rather than BaseHTTPMiddleware so the identity
+    ContextVars are set in the same task that runs the MCP app — with
+    BaseHTTPMiddleware the downstream app runs in a child task and context
+    propagation becomes subtle.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not settings.oauth_enabled:
+            return await self.app(scope, receive, send)
+
+        path = scope.get("path", "")
+        # Discovery must stay reachable to unauthenticated clients — that is how
+        # they learn where to authenticate.
+        if path.startswith("/.well-known/") or path == "/healthz":
+            return await self.app(scope, receive, send)
+
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        auth = headers.get("authorization", "")
+        if not auth.lower().startswith("bearer "):
+            return await _auth_challenge("Missing bearer token.")(scope, receive, send)
+
+        try:
+            claims = await validate_bearer_token(auth[7:].strip())
+        except PermissionError as e:
+            return await _auth_challenge(str(e), status=403)(scope, receive, send)
+        except Exception as e:
+            logger.warning("Rejected bearer token: %s", e)
+            return await _auth_challenge("Invalid or expired token.")(scope, receive, send)
+
+        sub = claims.get("sub")
+        if not sub:
+            return await _auth_challenge("Token has no 'sub' claim.")(scope, receive, send)
+
+        t_sub = _current_sub.set(sub)
+        t_claims = _current_claims.set(claims)
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _current_sub.reset(t_sub)
+            _current_claims.reset(t_claims)
+
+
+# ---------------------------------------------------------------------------
 # FastMCP Server
 # ---------------------------------------------------------------------------
 
@@ -262,26 +698,153 @@ mcp = FastMCP("wiki-js-mcp-server")
 
 @mcp.tool()
 async def wikijs_connection_status() -> str:
-    """Check Wiki.js connection and authentication status."""
+    """Check Wiki.js connection and authentication status for the current user."""
+    base: Dict[str, Any] = {
+        "api_url": settings.WIKIJS_URL,
+        "graphql_url": settings.graphql_url,
+        "server_version": __version__,
+        "auth_mode": "oauth" if settings.oauth_enabled else "single_user",
+    }
+
+    if settings.oauth_enabled:
+        try:
+            base["user"] = _describe_current_user()
+            base["key_registered"] = load_user_key(current_owner()) is not None
+        except AuthError as e:
+            return json.dumps({**base, "connected": False, "error": str(e), "status": "not_authenticated"})
+        if not base["key_registered"]:
+            return json.dumps({
+                **base,
+                "connected": False,
+                "status": "key_not_registered",
+                "next_step": "Call wikijs_register_my_key with your personal Wiki.js API key.",
+            })
+
     try:
         async with WikiJSClient() as c:
             await c.query("query { pages { list(limit: 1) { id } } }")
+        return json.dumps({**base, "connected": True, "authenticated": True, "status": "healthy"})
+    except Exception as e:
+        return json.dumps({**base, "connected": False, "error": str(e), "status": "connection_failed"})
+
+
+def _describe_current_user() -> Dict[str, Any]:
+    """Non-sensitive identity summary from the validated token."""
+    claims = _current_claims.get() or {}
+    return {
+        "sub": current_owner(),
+        "email": claims.get("email"),
+        "name": claims.get("name") or claims.get("preferred_username"),
+    }
+
+
+@mcp.tool()
+async def wikijs_whoami() -> str:
+    """Show who the server thinks you are and whether your Wiki.js key is registered."""
+    if not settings.oauth_enabled:
         return json.dumps({
-            "connected": True,
-            "authenticated": True,
-            "api_url": settings.WIKIJS_URL,
-            "graphql_url": settings.graphql_url,
-            "server_version": __version__,
-            "status": "healthy",
+            "auth_mode": "single_user",
+            "note": "This server uses one shared WIKIJS_API_KEY; there is no per-user identity.",
         })
+    try:
+        owner = current_owner()
+    except AuthError as e:
+        return json.dumps({"auth_mode": "oauth", "authenticated": False, "error": str(e)})
+
+    with get_db() as db:
+        row = db.query(UserKey).filter(UserKey.owner_sub == owner).first()
+        registered = row is not None
+        info = {
+            "label": row.label,
+            "encrypted_at_rest": row.is_encrypted,
+            "registered_at": row.created_at.isoformat() if row.created_at else None,
+            "last_used": row.last_used.isoformat() if row.last_used else None,
+        } if row else None
+
+    return json.dumps({
+        "auth_mode": "oauth",
+        "authenticated": True,
+        "user": _describe_current_user(),
+        "key_registered": registered,
+        "key": info,
+    })
+
+
+@mcp.tool()
+async def wikijs_register_my_key(api_key: str, label: str = "") -> str:
+    """
+    Register YOUR personal Wiki.js API key with this server (one-time setup).
+
+    Every wiki operation you request is then performed with this key, so you see
+    and change exactly what your own Wiki.js account is allowed to. The key is
+    stored server-side against your authenticated identity, encrypted at rest
+    when the server is configured with an encryption key.
+
+    Create a key in Wiki.js under Administration → API Access.
+
+    Args:
+        api_key: Your personal Wiki.js API key
+        label: Optional note to recognise this key later (e.g. 'laptop')
+    """
+    if not settings.oauth_enabled:
+        return json.dumps({
+            "error": "This server runs in single-user mode and uses the shared WIKIJS_API_KEY. "
+                     "Per-user keys require MCP_AUTH_MODE=oauth.",
+        })
+
+    api_key = (api_key or "").strip()
+    if not api_key:
+        return json.dumps({"error": "api_key must not be empty."})
+
+    try:
+        owner = current_owner()
+    except AuthError as e:
+        logger.error("Tool error: %s", e, exc_info=True)
+        raise
+
+    # Verify the key actually works before storing it — a bad key stored now
+    # would fail confusingly on every later call.
+    try:
+        async with WikiJSClient(api_key=api_key) as c:
+            await c.query("query { pages { list(limit: 1) { id } } }")
     except Exception as e:
         return json.dumps({
-            "connected": False,
-            "error": str(e),
-            "api_url": settings.WIKIJS_URL,
-            "server_version": __version__,
-            "status": "connection_failed",
+            "registered": False,
+            "error": f"Wiki.js rejected this key: {e}",
+            "hint": "Check the key is valid and has not expired in Administration → API Access.",
         })
+
+    store_user_key(owner, api_key, label)
+    logger.info("Registered Wiki.js key for user %s", owner)
+    return json.dumps({
+        "registered": True,
+        "user": _describe_current_user(),
+        "label": label,
+        "encrypted_at_rest": bool(settings.MCP_ENCRYPTION_KEY),
+        "status": "verified_and_stored",
+    })
+
+
+@mcp.tool()
+async def wikijs_forget_my_key() -> str:
+    """Delete your stored Wiki.js API key from this server."""
+    if not settings.oauth_enabled:
+        return json.dumps({"error": "This server runs in single-user mode; there is no stored per-user key."})
+
+    try:
+        owner = current_owner()
+    except AuthError as e:
+        logger.error("Tool error: %s", e, exc_info=True)
+        raise
+
+    with get_db() as db:
+        row = db.query(UserKey).filter(UserKey.owner_sub == owner).first()
+        if not row:
+            return json.dumps({"removed": False, "status": "no_key_registered"})
+        db.delete(row)
+
+    logger.info("Removed Wiki.js key for user %s", owner)
+    return json.dumps({"removed": True, "status": "deleted"})
 
 
 # ── Page CRUD ────────────────────────────────────────────────────────────────
@@ -587,7 +1150,7 @@ async def wikijs_delete_page(
                 result: Dict[str, Any] = {"deleted": True, "pageId": page_id, "status": "deleted"}
                 if remove_file_mapping:
                     with get_db() as db:
-                        mapping = db.query(FileMapping).filter(FileMapping.page_id == page_id).first()
+                        mapping = owned_mappings(db).filter(FileMapping.page_id == page_id).first()
                         if mapping:
                             db.delete(mapping)
                             result["file_mapping_removed"] = True
@@ -993,14 +1556,22 @@ async def wikijs_create_documentation_hierarchy(
                 if "error" not in ov:
                     created_pages.append(ov)
                     with get_db() as db:
-                        mapping = FileMapping(
-                            file_path=fp,
-                            page_id=ov["pageId"],
-                            relationship_type="documents",
-                            file_hash=get_file_hash(fp),
-                            repository_root=find_repo_root(fp) or "",
-                        )
-                        db.merge(mapping)
+                        existing = owned_mappings(db).filter(FileMapping.file_path == fp).first()
+                        if existing:
+                            existing.page_id = ov["pageId"]
+                            existing.relationship_type = "documents"
+                            existing.file_hash = get_file_hash(fp)
+                            existing.repository_root = find_repo_root(fp) or ""
+                            existing.last_updated = datetime.datetime.now(UTC)
+                        else:
+                            db.add(FileMapping(
+                                owner_sub=current_owner(),
+                                file_path=fp,
+                                page_id=ov["pageId"],
+                                relationship_type="documents",
+                                file_hash=get_file_hash(fp),
+                                repository_root=find_repo_root(fp) or "",
+                            ))
 
         return json.dumps({
             "project": project_name,
@@ -1200,7 +1771,7 @@ async def wikijs_link_file_to_page(
         fh = get_file_hash(file_path)
         repo = find_repo_root(file_path)
         with get_db() as db:
-            mapping = db.query(FileMapping).filter(FileMapping.file_path == file_path).first()
+            mapping = owned_mappings(db).filter(FileMapping.file_path == file_path).first()
             if mapping:
                 mapping.page_id = page_id
                 mapping.relationship_type = relationship
@@ -1208,6 +1779,7 @@ async def wikijs_link_file_to_page(
                 mapping.last_updated = datetime.datetime.now(UTC)
             else:
                 db.add(FileMapping(
+                    owner_sub=current_owner(),
                     file_path=file_path, page_id=page_id,
                     relationship_type=relationship, file_hash=fh, repository_root=repo or "",
                 ))
@@ -1234,7 +1806,7 @@ async def wikijs_sync_file_docs(
     """
     try:
         with get_db() as db:
-            mapping = db.query(FileMapping).filter(FileMapping.file_path == file_path).first()
+            mapping = owned_mappings(db).filter(FileMapping.file_path == file_path).first()
             if not mapping:
                 return json.dumps({"error": f"No page mapping for {file_path}. Use wikijs_link_file_to_page first."})
             page_id = mapping.page_id
@@ -1256,7 +1828,7 @@ async def wikijs_sync_file_docs(
             return update_raw
 
         with get_db() as db:
-            mapping = db.query(FileMapping).filter(FileMapping.file_path == file_path).first()
+            mapping = owned_mappings(db).filter(FileMapping.file_path == file_path).first()
             if mapping:
                 mapping.file_hash = get_file_hash(file_path)
                 mapping.last_updated = datetime.datetime.now(UTC)
@@ -1352,7 +1924,7 @@ async def wikijs_bulk_update_project_docs(
         for fp in affected_files:
             try:
                 with get_db() as db:
-                    mapping = db.query(FileMapping).filter(FileMapping.file_path == fp).first()
+                    mapping = owned_mappings(db).filter(FileMapping.file_path == fp).first()
                     has_mapping = mapping is not None
                     page_id = mapping.page_id if mapping else None
 
@@ -1390,7 +1962,7 @@ async def wikijs_cleanup_orphaned_mappings() -> str:
     """Remove local file→page mappings whose Wiki.js page no longer exists."""
     try:
         with get_db() as db:
-            mappings = db.query(FileMapping).all()
+            mappings = owned_mappings(db).all()
             orphaned, valid = [], []
 
             for m in mappings:
@@ -1416,13 +1988,22 @@ async def wikijs_cleanup_orphaned_mappings() -> str:
 
 @mcp.tool()
 async def wikijs_repository_context() -> str:
-    """Show current repository context and file→page mappings."""
+    """Show your file→page mappings, scoped to the current repository when local."""
     try:
-        repo_root = find_repo_root()
         with get_db() as db:
-            mappings = db.query(FileMapping).filter(FileMapping.repository_root == repo_root).all()
+            q = owned_mappings(db)
+            if settings.oauth_enabled:
+                # Remote multi-user mode: the server's working directory has no
+                # relation to the caller's machine, so scoping by it would hide
+                # every mapping. Return all of the caller's own mappings.
+                repo_root = None
+            else:
+                repo_root = find_repo_root()
+                q = q.filter(FileMapping.repository_root == repo_root)
+            mappings = q.all()
             result = {
                 "repository_root": repo_root,
+                "scope": "all_my_mappings" if repo_root is None else "current_repository",
                 "space_name": settings.DEFAULT_SPACE_NAME,
                 "mapped_files": len(mappings),
                 "mappings": [
@@ -1446,12 +2027,46 @@ async def wikijs_repository_context() -> str:
 # Entry point
 # ---------------------------------------------------------------------------
 
+def build_http_app():
+    """Wrap the FastMCP app with discovery endpoints and the auth gate."""
+    mcp_app = mcp.http_app()
+
+    routes = [
+        Route("/healthz", lambda request: JSONResponse({"status": "ok", "version": __version__})),
+    ]
+    if settings.oauth_enabled:
+        # Both spellings are registered: clients may probe the bare path or the
+        # resource-suffixed one derived from the MCP endpoint path.
+        routes += [
+            Route("/.well-known/oauth-protected-resource", protected_resource_metadata),
+            Route("/.well-known/oauth-protected-resource/mcp", protected_resource_metadata),
+        ]
+    routes.append(Mount("/", app=mcp_app))
+
+    app = Starlette(
+        routes=routes,
+        # FastMCP's session manager lives in its own lifespan; the wrapper must
+        # run it or the MCP endpoint returns 500 on first use.
+        lifespan=lambda _: mcp_app.router.lifespan_context(mcp_app),
+    )
+    return OAuthResourceServerMiddleware(app)
+
+
 async def run_http() -> None:
     """Run as HTTP server (Docker/remote)."""
     settings.validate_config()
-    logger.info(f"wiki-js-mcp-server v{__version__} HTTP mode — {settings.HTTP_HOST}:{settings.HTTP_PORT}")
-    app = mcp.http_app()
-    config = uvicorn.Config(app=app, host=settings.HTTP_HOST, port=settings.HTTP_PORT, log_level="info")
+    mode = "oauth multi-user" if settings.oauth_enabled else "single-user"
+    logger.info(
+        f"wiki-js-mcp-server v{__version__} HTTP mode ({mode}) — "
+        f"{settings.HTTP_HOST}:{settings.HTTP_PORT}"
+    )
+    if settings.oauth_enabled:
+        logger.info("OAuth issuer: %s", settings.OAUTH_ISSUER)
+        logger.info("Protected resource: %s", settings.resource_identifier)
+
+    config = uvicorn.Config(
+        app=build_http_app(), host=settings.HTTP_HOST, port=settings.HTTP_PORT, log_level="info"
+    )
     server = uvicorn.Server(config)
     await server.serve()
 

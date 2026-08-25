@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wiki-js-mcp-server"
 dynamic = ["version"]
-description = "Wiki.js MCP server — 24 tools, dual transport stdio/HTTP, production-ready"
+description = "Wiki.js MCP server — 27 tools, dual transport stdio/HTTP, multi-user OAuth connector"
 authors = [{name = "hub2rock"}]
 license = {text = "MIT"}
 requires-python = ">=3.11"
@@ -19,6 +19,7 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "tenacity>=8.0.0",
     "uvicorn[standard]>=0.24.0",
+    "pyjwt[crypto]>=2.8.0",
     "tzdata>=2024.1; sys_platform == 'win32'",
 ]
 

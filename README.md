@@ -1,6 +1,6 @@
 # Wiki.js MCP Server
 
-> A comprehensive **Model Context Protocol (MCP) server** for Wiki.js — 24 tools, dual transport (stdio + HTTP/SSE), built for production self-hosted infrastructure.
+> A comprehensive **Model Context Protocol (MCP) server** for Wiki.js — 27 tools, dual transport (stdio + HTTP/SSE), and a multi-user OAuth connector mode where each user brings their own Wiki.js credentials.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B%20%7C%203.14-blue)](https://www.python.org/)
@@ -103,7 +103,7 @@ Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 }
 ```
 
-Restart Claude Desktop → **Settings → Developer** → you should see `wikijs` with a 🟢 green dot and 24 tools listed.
+Restart Claude Desktop → **Settings → Developer** → you should see `wikijs` with a 🟢 green dot and 27 tools listed.
 
 ### 4. Verify the connection
 
@@ -111,13 +111,16 @@ Ask Claude: *"Check my Wiki.js connection status"* or *"List all pages in my wik
 
 ---
 
-## 📊 MCP Tools (24 Total)
+## 📊 MCP Tools (27 Total)
 
-### 🔧 Connection
+### 🔧 Connection & Identity
 
 | Tool | Description |
 |------|-------------|
 | `wikijs_connection_status` | Check connection & authentication health |
+| `wikijs_whoami` | Show your identity and whether your Wiki.js key is registered *(multi-user mode)* |
+| `wikijs_register_my_key` | Register your personal Wiki.js API key *(multi-user mode)* |
+| `wikijs_forget_my_key` | Delete your stored Wiki.js API key *(multi-user mode)* |
 
 ### 📝 Core Page Management
 
@@ -281,16 +284,107 @@ echo -n "user:password" | base64
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `WIKIJS_URL` | `http://localhost:3000` | Wiki.js base URL |
-| `WIKIJS_API_KEY` | — | API key (Full Access) |
+| `WIKIJS_API_KEY` | — | Shared API key. Used only when `MCP_AUTH_MODE=none` |
 | `WIKIJS_GRAPHQL_ENDPOINT` | `/graphql` | GraphQL endpoint path |
 | `MCP_TRANSPORT` | `stdio` | `stdio` or `http` |
 | `HTTP_HOST` | `0.0.0.0` | HTTP bind address |
 | `HTTP_PORT` | `8000` | HTTP listen port |
-| `WIKIJS_MCP_DB` | `./wikijs_mappings.db` | SQLite DB for file↔page mappings |
+| `WIKIJS_MCP_DB` | `./wikijs_mappings.db` | SQLite DB for file↔page mappings and per-user keys |
 | `LOG_FILE` | `./wikijs_mcp.log` | Log file path (**use absolute path in stdio mode**) |
 | `WIKIJS_DEFAULT_LOCALE` | *(empty)* | Locale for created/read pages. Empty = auto-detect the wiki's own default locale; set (e.g. `en`, `fr`) to force one |
 | `LOG_LEVEL` | `INFO` | `DEBUG` / `INFO` / `WARNING` / `ERROR` |
 | `DEFAULT_SPACE_NAME` | `Documentation` | Default space name for new structures |
+
+### Multi-user connector mode (`MCP_AUTH_MODE=oauth`)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MCP_AUTH_MODE` | `none` | `none` = one shared key; `oauth` = per-user keys behind OAuth 2.1 |
+| `MCP_PUBLIC_URL` | — | Public HTTPS base URL of this server (**required**) |
+| `OAUTH_ISSUER` | — | OAuth/OIDC issuer URL (**required**) |
+| `OAUTH_JWKS_URL` | *(discovered)* | Override JWKS URL instead of OIDC discovery |
+| `OAUTH_AUDIENCE` | *(empty)* | Expected `aud` claim. Empty = no audience check |
+| `OAUTH_ALGORITHMS` | `RS256` | Accepted signing algorithms |
+| `OAUTH_REQUIRED_SCOPES` | *(empty)* | Scopes a token must carry. Empty = no scope check |
+| `OAUTH_SUPPORTED_SCOPES` | `openid profile email` | Scopes advertised in resource metadata |
+| `MCP_ENCRYPTION_KEY` | *(empty)* | Fernet key encrypting stored user keys at rest (**recommended**) |
+
+---
+
+## 👥 Multi-User Connector Mode
+
+By default the server uses one shared `WIKIJS_API_KEY` — fine for personal use,
+but everyone would act as the same Wiki.js account. In **connector mode** each
+user authenticates via OAuth 2.1 and registers **their own** Wiki.js API key, so
+Wiki.js enforces that user's own permissions on every read and write.
+
+```
+Claude  ──OAuth 2.1──►  MCP Server  ──user's own API key──►  Wiki.js
+        (per user)                     (per user)
+```
+
+Mappings and keys are stored per OAuth subject: two users never see each other's
+credentials or file↔page mappings.
+
+### 1. Create an OAuth application
+
+Any OIDC provider works (Authentik, Keycloak, Auth0, Okta, Entra ID). Configure:
+
+- Grant type **authorization code** with **PKCE**
+- Scopes `openid profile email`
+- Redirect URI: the callback Claude shows you when adding the connector
+
+### 2. Configure the server
+
+```env
+MCP_TRANSPORT=http
+MCP_AUTH_MODE=oauth
+MCP_PUBLIC_URL=https://mcp-wiki.example.com
+OAUTH_ISSUER=https://auth.example.com/application/o/wikijs-mcp/
+OAUTH_AUDIENCE=<your-client-id>
+MCP_ENCRYPTION_KEY=<generated below>
+# WIKIJS_API_KEY is not used in this mode — leave it empty
+```
+
+Generate the encryption key:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+> ⚠️ Changing `MCP_ENCRYPTION_KEY` later makes every stored key unreadable —
+> users would each have to re-register. Back it up with your other secrets.
+
+### 3. Expose it publicly
+
+Claude connects from **Anthropic's cloud**, not from the user's machine — so the
+URL must be reachable from the public internet over HTTPS. Use the nginx config
+[above](#2-nginx-reverse-proxy), minus the `auth_basic` lines (OAuth replaces it).
+
+Verify discovery works before going further:
+
+```bash
+curl https://mcp-wiki.example.com/.well-known/oauth-protected-resource
+```
+
+### 4. Add the connector in Claude
+
+**Settings → Connectors → Add custom connector** → URL
+`https://mcp-wiki.example.com/mcp`, plus your Client ID/Secret under
+*Advanced settings*. On Team/Enterprise an Owner adds it in Organization settings.
+
+### 5. Each user registers their key — once
+
+After connecting, every user runs this once:
+
+> Register my Wiki.js key: `<their personal API key>`
+
+The server verifies the key against Wiki.js before storing it, so a typo fails
+immediately instead of at the next operation. From then on every wiki action
+they ask for runs as their own Wiki.js account.
+
+Useful checks: *"What's my wiki identity?"* (`wikijs_whoami`) and
+*"Forget my wiki key"* (`wikijs_forget_my_key`).
 
 ---
 
@@ -339,6 +433,27 @@ Use `wikijs_get_page_metadata` to check the page size, then either:
 - Check that the API key has Full Access permissions
 - Run `wikijs_connection_status` from Claude to get a detailed status
 
+### Connector mode: Claude can't connect
+- The server must be reachable **from the public internet** — Claude connects
+  from Anthropic's cloud, not from your machine. A firewalled or LAN-only host
+  will fail even though your browser can reach it.
+- Check discovery returns JSON:
+  `curl https://your-host/.well-known/oauth-protected-resource`
+- Confirm `MCP_PUBLIC_URL` matches the URL you gave Claude, scheme included.
+
+### Connector mode: `401 Invalid or expired token`
+Run with `LOG_LEVEL=DEBUG` — the server logs the exact rejection reason. Common causes:
+- `OAUTH_ISSUER` does not exactly match the token's `iss` claim (a trailing
+  slash counts)
+- `OAUTH_AUDIENCE` set but the token's `aud` is your client ID — set it to match, or leave it empty
+- Clock skew beyond 60s between your provider and the server
+
+### Connector mode: "No Wiki.js API key registered"
+Expected on first use. Ask Claude to register your key — see
+[step 5](#5-each-user-registers-their-key--once). If it appears after it
+previously worked, `MCP_ENCRYPTION_KEY` likely changed: every user must
+re-register, since old values can no longer be decrypted.
+
 ---
 
 ## 📁 Project Structure
@@ -346,7 +461,7 @@ Use `wikijs_get_page_metadata` to check the page size, then either:
 ```
 wiki-js-mcp-server/
 ├── src/
-│   └── server.py              # MCP server — all 24 tools
+│   └── server.py              # MCP server — all 27 tools
 ├── config/
 │   └── example.env            # Configuration template
 ├── Dockerfile                 # python:3.12-slim, non-root user
