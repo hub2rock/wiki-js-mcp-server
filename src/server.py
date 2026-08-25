@@ -2061,8 +2061,11 @@ async def run_http() -> None:
         f"{settings.HTTP_HOST}:{settings.HTTP_PORT}"
     )
     if settings.oauth_enabled:
-        logger.info("OAuth issuer: %s", settings.OAUTH_ISSUER)
         logger.info("Protected resource: %s", settings.resource_identifier)
+        # The discovery document names the configured issuer, so log the URL to
+        # curl rather than the issuer itself — same diagnostic, nothing from the
+        # settings object echoed into the log.
+        logger.info("Discovery: %s", _resource_metadata_url())
 
     config = uvicorn.Config(
         app=build_http_app(), host=settings.HTTP_HOST, port=settings.HTTP_PORT, log_level="info"
